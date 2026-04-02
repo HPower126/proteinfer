@@ -26,6 +26,8 @@ import utils
 import tensorflow.compat.v1 as tf
 import tqdm
 
+tf.disable_v2_behavior()
+
 _logger = logging.getLogger('proteinfer')
 
 FLAGS = flags.FLAGS
