@@ -31,100 +31,40 @@ from absl import logging
 import numpy as np
 import pandas as pd
 import utils
-import six
 import tensorflow.compat.v1 as tf
-import tensorflow_hub as hub
 import tqdm
 import scipy.sparse
 
 
 def call_module(module, one_hots, row_lengths, signature):
-  """Call a tf_hub.Module using the standard blundell signature.
+  raise NotImplementedError(
+      'call_module relies on the deprecated TensorFlow Hub Module API. '
+      'Use Inferrer for runtime inference instead.')
 
-  This expects that `module` has a signature named `signature` which conforms to
-      ('sequence',
-       'sequence_length') -> output
 
-  To use an existing SavedModel
-  file you may want to create a module_spec with
-  `tensorflow_hub.saved_model_module.create_module_spec_from_saved_model`.
+def _one_hot_batch(seqs):
+  """Converts a batch of amino-acid strings to a padded one-hot tensor."""
+  row_lengths = np.array([len(seq) for seq in seqs], dtype=np.int32)
+  max_length = row_lengths.max(initial=0)
+  batch = np.zeros(
+      (len(seqs), max_length, len(utils.AMINO_ACID_VOCABULARY)),
+      dtype=np.float32)
 
-  Args:
-    module: a tf_hub.Module to call.
-    one_hots: a rank 3 tensor with one-hot encoded sequences of residues.
-    row_lengths: a rank 1 tensor with sequence lengths.
-    signature: the graph signature to validate and call.
+  for idx, seq in enumerate(seqs):
+    encoded = utils.residues_to_one_hot(seq).astype(np.float32, copy=False)
+    batch[idx, :encoded.shape[0], :] = encoded
 
-  Returns:
-    The output tensor of `module`.
-  """
-  if signature not in module.get_signature_names():
-    raise ValueError('signature not in ' +
-                     six.ensure_str(str(module.get_signature_names())) +
-                     '. Was ' + six.ensure_str(signature) + '.')
-  inputs = module.get_input_info_dict(signature=signature)
-  expected_inputs = [
-      'sequence',
-      'sequence_length',
-  ]
-  if set(inputs.keys()) != set(expected_inputs):
-    raise ValueError(
-        'The signature_def does not have the expected inputs. Please '
-        'reconfigure your saved model to only export signatures '
-        'with sequence and length inputs. (Inputs were %s, expected %s)' %
-        (str(inputs), str(expected_inputs)))
-
-  outputs = module.get_output_info_dict(signature=signature)
-  if len(outputs) > 1:
-    raise ValueError('The signature_def given has more than one output. Please '
-                     'reconfigure your saved model to only export signatures '
-                     'with one output. (Outputs were %s)' % str(outputs))
-
-  return list(
-      module({
-          'sequence': one_hots,
-          'sequence_length': row_lengths,
-      },
-             signature=signature,
-             as_dict=True).values())[0]
+  return batch, row_lengths
 
 
 def in_graph_inferrer(sequences,
                       savedmodel_dir_path,
                       signature,
                       name_scope='inferrer'):
-  """Add an in-graph inferrer to the active default graph.
-
-  Additionally performs in-graph preprocessing, splitting strings, and encoding
-  residues.
-
-  Args:
-    sequences: A tf.string Tensor representing a batch of sequences with shape
-      [None].
-    savedmodel_dir_path: Path to the directory with the SavedModel binary.
-    signature: Name of the signature to use in `savedmodel_dir_path`. e.g.
-      'pooled_representation'
-    name_scope: Name scope to use for the loaded saved model.
-
-  Returns:
-    Output Tensor
-  Raises:
-    ValueError if signature does not conform to
-      ('sequence',
-       'sequence_length') -> output
-    or if the specified signature is not present.
-  """
-  # Add variable to make it easier to refactor with multiple tags in future.
-  tags = [tf.saved_model.tag_constants.SERVING]
-
-  # Tokenization
-  residues = tf.strings.unicode_split(sequences, 'UTF-8')
-  # Convert to one-hots and pad.
-  one_hots, row_lengths = utils.in_graph_residues_to_onehot(residues)
-  module_spec = hub.saved_model_module.create_module_spec_from_saved_model(
-      savedmodel_dir_path)
-  module = hub.Module(module_spec, trainable=False, tags=tags, name=name_scope)
-  return call_module(module, one_hots, row_lengths, signature)
+  del sequences, savedmodel_dir_path, signature, name_scope
+  raise NotImplementedError(
+      'in_graph_inferrer relies on the deprecated TensorFlow Hub Module API. '
+      'Use Inferrer for runtime inference instead.')
 
 
 @functools.lru_cache(maxsize=None)
@@ -192,22 +132,38 @@ class Inferrer(object):
           savedmodel_dir_path)
     self.batch_size = batch_size
     self._graph = tf.Graph()
-    self._model_name_scope = 'inferrer'
     with self._graph.as_default():
-      self._sequences = tf.placeholder(
-          shape=[None], dtype=tf.string, name='sequences')
-      self._fetch = in_graph_inferrer(
-          self._sequences,
-          savedmodel_dir_path,
-          activation_type,
-          name_scope=self._model_name_scope)
       self._sess = tf.Session(
           config=session_config if session_config else tf.ConfigProto())
-      self._sess.run([
-          tf.initializers.global_variables(),
-          tf.initializers.local_variables(),
-          tf.initializers.tables_initializer(),
-      ])
+      meta_graph_def = tf.saved_model.loader.load(
+          self._sess, [tf.saved_model.tag_constants.SERVING],
+          savedmodel_dir_path)
+      signature_def = meta_graph_def.signature_def.get(activation_type)
+      if signature_def is None:
+        raise ValueError('signature not in {}. Was {}.'.format(
+            sorted(meta_graph_def.signature_def.keys()), activation_type))
+
+      expected_inputs = {'sequence', 'sequence_length'}
+      actual_inputs = set(signature_def.inputs.keys())
+      if actual_inputs != expected_inputs:
+        raise ValueError(
+            'The signature_def does not have the expected inputs. Please '
+            'reconfigure your saved model to only export signatures '
+            'with sequence and length inputs. (Inputs were %s, expected %s)' %
+            (str(sorted(actual_inputs)), str(sorted(expected_inputs))))
+
+      if len(signature_def.outputs) != 1:
+        raise ValueError(
+            'The signature_def given has more than one output. Please '
+            'reconfigure your saved model to only export signatures '
+            'with one output. (Outputs were %s)' % str(signature_def.outputs))
+
+      self._sequence_tensor = self._graph.get_tensor_by_name(
+          signature_def.inputs['sequence'].name)
+      self._sequence_length_tensor = self._graph.get_tensor_by_name(
+          signature_def.inputs['sequence_length'].name)
+      self._fetch = self._graph.get_tensor_by_name(
+          next(iter(signature_def.outputs.values())).name)
 
     self._savedmodel_dir_path = savedmodel_dir_path
     self.activation_type = activation_type
@@ -224,8 +180,7 @@ class Inferrer(object):
                 self.activation_type)
 
   def _get_tensor_by_name(self, name):
-    return self._graph.get_tensor_by_name('{}/{}'.format(
-        self._model_name_scope, name))
+    return self._graph.get_tensor_by_name(name)
 
   def _get_activations_for_batch_unmemoized(self,
                                             seqs,
@@ -256,8 +211,12 @@ class Inferrer(object):
       fetch = self._get_tensor_by_name(custom_tensor_to_retrieve)
     else:
       fetch = self._fetch
-    with self._graph.as_default():
-      return self._sess.run(fetch, {self._sequences: seqs})
+    batch_one_hots, row_lengths = _one_hot_batch(seqs)
+    return self._sess.run(
+        fetch, {
+            self._sequence_tensor: batch_one_hots,
+            self._sequence_length_tensor: row_lengths,
+        })
 
   @functools.lru_cache(maxsize=None)
   def _get_activations_for_batch_memoized(self,
@@ -280,7 +239,7 @@ class Inferrer(object):
       np.array of scipy sparse coo matrices of shape [num_of_seqs_in_batch, ...]
       where ... is the shape of the fetch tensor.
     """
-    np_seqs = np.array(list_of_seqs, dtype=np.object)
+    np_seqs = np.array(list_of_seqs, dtype=object)
     if np_seqs.size == 0:
       return np.array([], dtype=float)
 
